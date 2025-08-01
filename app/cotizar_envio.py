@@ -2,11 +2,11 @@ import streamlit as st
 import sqlite3
 from datetime import date
 from pdf_generator import generar_pdf_cotizacion
+import uuid
 
 def cotizar_envio(usuario):
     st.subheader("📦 Cotización de Envío")
 
-    # Inicializar session_state solo una vez
     if "origen" not in st.session_state:
         st.session_state.origen = ""
     if "destino" not in st.session_state:
@@ -20,7 +20,6 @@ def cotizar_envio(usuario):
     if "tipo_unidad" not in st.session_state:
         st.session_state.tipo_unidad = "Camioneta"
 
-    # Inputs con claves para mantener estado
     origen = st.text_input("Origen", key="origen")
     destino = st.text_input("Destino", key="destino")
     distancia = st.number_input("Distancia estimada (km)", min_value=1, key="distancia")
@@ -35,7 +34,11 @@ def cotizar_envio(usuario):
         precio_por_km = 10  # Precio fijo por kilómetro
         precio_total = distancia * precio_por_km
 
+        cotizacion_id = str(uuid.uuid4())[:8]
+        estatus_url = f"https://eonlogisticgroup.com/estatus/{cotizacion_id}"
+
         datos = {
+            "cotizacion_id": cotizacion_id,
             "fecha": str(date.today()),
             "origen": origen,
             "destino": destino,
@@ -44,16 +47,17 @@ def cotizar_envio(usuario):
             "descripcion_paquete": descripcion,
             "tipo_unidad": tipo_unidad,
             "precio_total": precio_total,
-            "cliente": usuario
+            "cliente": usuario,
+            "estatus_url": estatus_url
         }
 
-        # Guardar en la base de datos
         conn = sqlite3.connect("eon.db")
         cursor = conn.cursor()
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS cotizaciones (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cotizacion_id TEXT,
                 cliente TEXT,
                 origen TEXT,
                 destino TEXT,
@@ -62,19 +66,22 @@ def cotizar_envio(usuario):
                 descripcion_paquete TEXT,
                 tipo_unidad TEXT,
                 precio_total REAL,
-                fecha TEXT
+                fecha TEXT,
+                estatus_url TEXT,
+                archivo_pdf TEXT,
+                proveedor_asignado TEXT
             )
         """)
 
         cursor.execute("""
             INSERT INTO cotizaciones (
-                cliente, origen, destino, distancia_km, peso_kg, 
-                descripcion_paquete, tipo_unidad, precio_total, fecha
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cotizacion_id, cliente, origen, destino, distancia_km, peso_kg,
+                descripcion_paquete, tipo_unidad, precio_total, fecha, estatus_url
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            datos["cliente"], datos["origen"], datos["destino"],
+            datos["cotizacion_id"], datos["cliente"], datos["origen"], datos["destino"],
             datos["distancia"], datos["peso"], datos["descripcion_paquete"],
-            datos["tipo_unidad"], datos["precio_total"], datos["fecha"]
+            datos["tipo_unidad"], datos["precio_total"], datos["fecha"], datos["estatus_url"]
         ))
 
         conn.commit()
