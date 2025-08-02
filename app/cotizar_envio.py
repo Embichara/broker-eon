@@ -31,8 +31,9 @@ def cotizar_envio(usuario):
     )
 
     if st.button("Calcular cotización"):
-        precio_por_km = 10  # Precio fijo por kilómetro
-        precio_total = distancia * precio_por_km
+        precio_total = obtener_precio_con_margen(origen, destino, usuario, tipo_unidad)
+        if precio_total is not None:
+            st.success(f"✅ Cotización sugerida: ${precio_total:,.2f} MXN")
 
         cotizacion_id = str(uuid.uuid4())[:8]
         estatus_url = f"https://eonlogisticgroup.com/estatus/{cotizacion_id}"
@@ -96,3 +97,43 @@ def cotizar_envio(usuario):
             file_name=archivo.split("/")[-1],
             mime="application/pdf"
         )
+
+import os
+
+def obtener_precio_con_margen(origen, destino, cliente, unidad):
+    DB_PATH = os.path.abspath("eon.db")
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # 1. Obtener tarifa base
+    cursor.execute("SELECT tarifa_base FROM tarifas WHERE origen = ? AND destino = ?", (origen, destino))
+    resultado = cursor.fetchone()
+    if not resultado:
+        st.error("⚠️ No existe una tarifa base para esta ruta.")
+        conn.close()
+        return None
+    tarifa_base = resultado[0]
+
+    # 2. Buscar margen (cliente > unidad > general)
+    margen = 0
+    cursor.execute("SELECT margen_porcentaje FROM margenes WHERE criterio = 'cliente' AND valor = ?", (cliente,))
+    res_cliente = cursor.fetchone()
+
+    if res_cliente:
+        margen = res_cliente[0]
+    else:
+        cursor.execute("SELECT margen_porcentaje FROM margenes WHERE criterio = 'unidad' AND valor = ?", (unidad,))
+        res_unidad = cursor.fetchone()
+        if res_unidad:
+            margen = res_unidad[0]
+        else:
+            cursor.execute("SELECT margen_porcentaje FROM margenes WHERE criterio = 'general' AND valor = 'General'")
+            res_general = cursor.fetchone()
+            if res_general:
+                margen = res_general[0]
+
+    conn.close()
+
+    # 3. Calcular precio final
+    precio_final = tarifa_base * (1 + margen / 100)
+    return precio_final

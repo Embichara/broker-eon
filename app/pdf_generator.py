@@ -28,7 +28,7 @@ def generar_pdf_cotizacion(datos, nombre_archivo="cotizacion.pdf"):
     # URL de seguimiento
     if "estatus_url" in datos:
         pdf.set_text_color(0, 0, 255)
-        pdf.cell(0, 10, "📍 Seguimiento en línea:", ln=True)
+        pdf.cell(0, 10, "Seguimiento en línea:", ln=True)
         pdf.cell(0, 10, datos["estatus_url"], ln=True, link=datos["estatus_url"])
         pdf.set_text_color(0, 0, 0)
         pdf.ln(5)
