@@ -1,5 +1,6 @@
 # EON OPS DASHBOARD - Streamlit Structure (Base Multipage)
 
+import requests
 import streamlit as st
 import sqlite3
 from datetime import date
@@ -10,9 +11,59 @@ import os
 import smtplib
 from email.message import EmailMessage
 import os
+import sys, os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
 from datetime import datetime, timedelta
+from carriers.dhl_client import cotizar_dhl, normalizar_ofertas_dhl
+
+def cotizar_dhl_api():
+    import pandas as pd
+    import streamlit as st
+    from carriers.dhl_client import dhl_rate_request, parse_rates_to_rows
+    st.subheader("🟡 Cotizar vía API (DHL Express)")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        origen_pais = st.text_input("País Origen (ISO-2)", value="MX")
+        origen_cp = st.text_input("C.P. Origen", value="64000")
+        peso = st.number_input("Peso (kg)", min_value=0.1, value=5.0)
+        largo = st.number_input("Largo (cm)", min_value=1.0, value=10.0)
+    with col2:
+        destino_pais = st.text_input("País Destino (ISO-2)", value="MX")
+        destino_cp = st.text_input("C.P. Destino", value="03100")
+        ancho = st.number_input("Ancho (cm)", min_value=1.0, value=10.0)
+        alto = st.number_input("Alto (cm)", min_value=1.0, value=10.0)
+
+    if st.button("📡 Consultar tarifas DHL"):
+        try:
+            data = dhl_rate_request(
+                origin_country=origen_pais.strip().upper(),
+                origin_postal=origen_cp.strip(),
+                dest_country=destino_pais.strip().upper(),
+                dest_postal=destino_cp.strip(),
+                weight_kg=peso,
+                length_cm=largo, width_cm=ancho, height_cm=alto
+            )
+            rows = parse_rates_to_rows(data)
+            if not rows:
+                st.warning("DHL respondió sin tarifas. Verifica datos o credenciales.")
+                st.caption("Respuesta recibida (debug):")
+                st.code(data, language="json")
+            else:
+                df = pd.DataFrame(rows)
+                st.dataframe(df, use_container_width=True)
+                with st.expander("Ver JSON completo (debug)"):
+                    st.code(data, language="json")
+        except requests.HTTPError as e:
+            st.error(f"HTTPError DHL: {e}")
+            try:
+                st.code(e.response.text, language="json")
+            except Exception:
+                pass
+        except Exception as ex:
+            st.error(f"Error inesperado: {ex}")
 
 def pricing_module():
     st.subheader("📈 Sistema de Pricing - EON Logistics")
@@ -285,9 +336,13 @@ def nueva_cotizacion_manual():
     peso = st.number_input("Peso del paquete (kg)", min_value=0.1)
     descripcion = st.text_area("Descripción del paquete")
     cliente = st.text_input("Nombre del cliente")
-    precio_total = st.number_input("Precio total (MXN)", min_value=1.0)
+    # precio_total = st.number_input("Precio total (MXN)", min_value=1.0)
 
-    if st.button("\U0001F4BE Guardar cotización"):
+    if not origen or not destino or not cliente or peso <= 0:
+        st.warning("Por favor llena todos los campos correctamente.")
+        return
+
+    if st.button("💾 Guardar cotización"):
         cotizacion_id = str(uuid.uuid4())[:8]
         estatus_url = f"https://eonlogisticgroup.com/estatus/{cotizacion_id}"
 
@@ -295,25 +350,56 @@ def nueva_cotizacion_manual():
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
 
+        # Buscar tarifa base por ruta
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS cotizaciones (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cotizacion_id TEXT,
-                cliente TEXT,
-                origen TEXT,
-                destino TEXT,
-                distancia_km REAL,
-                peso_kg REAL,
-                descripcion_paquete TEXT,
-                tipo_unidad TEXT,
-                precio_total REAL,
-                fecha TEXT,
-                estatus_url TEXT,
-                archivo_pdf TEXT,
-                proveedor_asignado TEXT
-            )
-        """)
+            SELECT tarifa_base FROM tarifas WHERE origen = ? AND destino = ?
+        """, (origen, destino))
+        resultado_tarifa = cursor.fetchone()
 
+        if not resultado_tarifa:
+            st.error("No se encontró una tarifa base para esta ruta. Configúrala en el módulo de Pricing.")
+            conn.close()
+            return
+
+        tarifa_base = resultado_tarifa[0]
+
+        if resultado_tarifa:
+            tarifa_base = resultado_tarifa[0]
+        else:
+            st.error("No se encontró una tarifa base para esta ruta.")
+            conn.close()
+            return
+
+        cursor.execute("""
+            SELECT margen_porcentaje FROM margenes WHERE criterio = 'unidad' AND valor = ?
+        """, (tipo_unidad,))
+        resultado_margen_unidad = cursor.fetchone()
+
+        if not resultado_margen_unidad:
+            st.error(f"No se encontró un margen de utilidad para la unidad: {tipo_unidad}. Configúralo en el módulo de Pricing.")
+            conn.close()
+            return
+
+        margen_unidad = resultado_margen_unidad[0]
+
+        # Buscar margen por peso (rango)
+        cursor.execute("""
+            SELECT margen_porcentaje FROM margenes_peso WHERE ? BETWEEN rango_min AND rango_max
+        """, (peso,))
+        resultado_margen_peso = cursor.fetchone()
+
+        if not resultado_margen_peso:
+            st.error(f"No se encontró un margen de utilidad para el peso: {peso} kg. Configúralo en el módulo de Pricing.")
+            conn.close()
+            return
+
+        margen_peso = resultado_margen_peso[0]
+
+        # Cálculo del precio total con ambos márgenes
+        precio_sin_margen = tarifa_base * peso
+        precio_total = precio_sin_margen * (1 + margen_unidad / 100) * (1 + margen_peso / 100)
+
+        # Insertar cotización en la base de datos
         cursor.execute("""
             INSERT INTO cotizaciones (
                 cotizacion_id, cliente, origen, destino, distancia_km, peso_kg,
@@ -324,10 +410,41 @@ def nueva_cotizacion_manual():
             descripcion, tipo_unidad, precio_total, str(date.today()), estatus_url
         ))
 
+        # Obtener el ID de la cotización recién creada
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM cotizaciones WHERE cotizacion_id = ?", (cotizacion_id,))
+        resultado_cotizacion = cursor.fetchone()
+        id_cotizacion = resultado_cotizacion[0]
+
+        # Buscar proveedores compatibles
+        cursor.execute("""
+            SELECT proveedor, factor_precio FROM proveedores_rutas
+            WHERE origen = ? AND destino = ? AND tipo_unidad = ?
+        """, (origen, destino, tipo_unidad))
+        proveedores = cursor.fetchall()
+
+        # Insertar ofertas automáticas
+        from datetime import datetime
+        fecha_actual = str(datetime.now().date())
+
+        for proveedor, factor_precio in proveedores:
+            precio_ofertado = precio_total * factor_precio
+            mensaje = f"Oferta automática generada para {proveedor}"
+            cursor.execute("""
+                INSERT INTO ofertas (id_cotizacion, proveedor, precio_ofertado, mensaje, fecha)
+                VALUES (?, ?, ?, ?, ?)
+            """, (id_cotizacion, proveedor, precio_ofertado, mensaje, fecha_actual))
+
         conn.commit()
         conn.close()
 
-        st.success(f"Cotización guardada correctamente (ID: {cotizacion_id})")
+        st.success(f"Se generaron {len(proveedores)} ofertas automáticas.")
+
+        conn.commit()
+        conn.close()
+
+        st.success(f"Cotización generada automáticamente: ${precio_total:,.2f} MXN")
         st.write(f"Estatus URL: {estatus_url}")
 
 def cotizaciones_pendientes():
@@ -621,7 +738,98 @@ elif menu == "Cotizaciones":
     if opcion == "Nueva Cotización (Manual)":
         nueva_cotizacion_manual()
     elif opcion == "Cotizar vía API (DHL)":
-        st.write("Llamar API de DHL (placeholder hasta tener API Key)")
+        from carriers.dhl_client import cotizar_dhl, normalizar_ofertas_dhl
+        st.subheader("🚚 Cotizar vía API (DHL)")
+
+        colA, colB = st.columns(2)
+        with colA:
+            origen_cp = st.text_input("CP Origen", "64000")
+            origen_ciudad = st.text_input("Ciudad Origen", "Monterrey")
+            peso = st.number_input("Peso (kg)", min_value=0.1, value=5.0)
+        with colB:
+            destino_cp = st.text_input("CP Destino", "01000")
+            destino_ciudad = st.text_input("Ciudad Destino", "Ciudad de México")
+            dimensiones = st.text_input("Dimensiones LxAxH (cm)", "10x10x10")
+
+        largo, ancho, alto = 10.0, 10.0, 10.0
+        try:
+            l, a, h = dimensiones.lower().split("x")
+            largo, ancho, alto = float(l), float(a), float(h)
+        except Exception:
+            pass
+
+        if st.button("🔎 Cotizar DHL"):
+            try:
+                res = cotizar_dhl(
+                    origen_cp, destino_cp, peso,
+                    largo=largo, ancho=ancho, alto=alto,
+                    origin_city=origen_ciudad, dest_city=destino_ciudad,
+                    is_customs_declarable=False
+                )
+                dhl_json = res["json"]
+                ofertas = normalizar_ofertas_dhl(dhl_json)
+
+                if not ofertas:
+                    st.warning("DHL no devolvió precios utilizables para estos parámetros.")
+                else:
+                    st.success(f"{len(ofertas)} opción(es) encontradas.")
+                    for of in ofertas:
+                        with st.expander(f"{of['productName']} — {of['totalPrice']} {of['currency']}"):
+                            st.write(f"**Código:** {of['productCode']}")
+                            st.write(f"**ETA (estimado):** {of['eta'] or 'N/D'}")
+                            st.json(of["raw"])
+
+                    # 👉 Selección rápida para ofertar
+                    idx = st.selectbox(
+                        "Elige oferta para registrar en el sistema",
+                        options=list(range(len(ofertas))),
+                        format_func=lambda i: f"{ofertas[i]['productName']} - {ofertas[i]['totalPrice']} {ofertas[i]['currency']}"
+                    )
+
+                    if st.button("💾 Registrar oferta DHL"):
+                        of = ofertas[idx]
+
+                        import sqlite3, uuid
+                        DB_PATH = os.path.abspath("eon.db")
+                        conn = sqlite3.connect(DB_PATH)
+                        cursor = conn.cursor()
+
+                        # Asegura tabla ofertas
+                        cursor.execute("""
+                            CREATE TABLE IF NOT EXISTS ofertas (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                id_cotizacion INTEGER,
+                                proveedor TEXT,
+                                precio_ofertado REAL,
+                                mensaje TEXT,
+                                fecha TEXT
+                            )
+                        """)
+
+                        # Selecciona la ultima cotización pendiente (o deja elegir)
+                        df_cots = pd.read_sql_query("""
+                            SELECT id, cliente, origen, destino, precio_total, fecha
+                            FROM cotizaciones
+                            ORDER BY fecha DESC
+                        """, conn)
+                        if df_cots.empty:
+                            st.warning("No hay cotizaciones en la base de datos para asociar esta oferta.")
+                        else:
+                            # Simple: asocia a la más reciente por ahora
+                            cot_id = int(df_cots.iloc[0]["id"])
+                            mensaje = f"DHL {of['productName']} • ETA: {of['eta'] or 'N/D'}"
+
+                            cursor.execute("""
+                                INSERT INTO ofertas (id_cotizacion, proveedor, precio_ofertado, mensaje, fecha)
+                                VALUES (?, ?, ?, ?, DATE('now'))
+                            """, (cot_id, "DHL", of["totalPrice"], mensaje))
+                            conn.commit()
+                            conn.close()
+
+                            st.success(f"Oferta de DHL registrada en la cotización #{cot_id}.")
+            except Exception as e:
+                st.error(f"Error al cotizar DHL: {e}")
+
     elif opcion == "Pendientes por Asignar":
         cotizaciones_pendientes()
     elif opcion == "Cotizaciones Asignadas":
@@ -629,7 +837,62 @@ elif menu == "Cotizaciones":
 
 elif menu == "Pricing":
     st.title("📈 Pricing EON")
-    st.write("Configuración manual de tarifas base y márgenes.")
+
+    DB_PATH = os.path.abspath("eon.db")
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    st.subheader("Tarifas Base por Ruta")
+
+    # Mostrar tarifas actuales
+    tarifas_df = pd.read_sql_query("SELECT * FROM tarifas", conn)
+    st.dataframe(tarifas_df, use_container_width=True)
+
+    st.markdown("### ➕ Agregar / Modificar Tarifa")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        origen = st.text_input("Origen (Nuevo / Existente)")
+    with col2:
+        destino = st.text_input("Destino (Nuevo / Existente)")
+    with col3:
+        tarifa_base = st.number_input("Tarifa Base (MXN/km)", min_value=1.0)
+
+    if st.button("💾 Guardar Tarifa"):
+        cursor.execute("""
+            INSERT INTO tarifas (origen, destino, tarifa_base)
+            VALUES (?, ?, ?)
+            ON CONFLICT(origen, destino) DO UPDATE SET tarifa_base=excluded.tarifa_base
+        """, (origen, destino, tarifa_base))
+        conn.commit()
+        st.success("Tarifa guardada correctamente.")
+        st.rerun()
+
+    st.markdown("---")
+    st.subheader("Márgenes de Utilidad")
+
+    margenes_df = pd.read_sql_query("SELECT * FROM margenes", conn)
+    st.dataframe(margenes_df, use_container_width=True)
+
+    st.markdown("### ➕ Agregar / Modificar Margen")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        criterio = st.selectbox("Criterio", ["Tipo de Unidad", "Peso"])
+    with col2:
+        valor = st.text_input("Valor (Ej: Camión 3.5t o 0-500kg)")
+    with col3:
+        margen = st.number_input("Margen (%)", min_value=0.0)
+
+    if st.button("💾 Guardar Margen"):
+        cursor.execute("""
+            INSERT INTO margenes (criterio, valor, margen_porcentaje)
+            VALUES (?, ?, ?)
+            ON CONFLICT(criterio, valor) DO UPDATE SET margen_porcentaje=excluded.margen_porcentaje
+        """, (criterio, valor, margen))
+        conn.commit()
+        st.success("Margen guardado correctamente.")
+        st.rerun()
+
+    conn.close()
 
 elif menu == "Proveedores":
     st.title("🚛 Gestión de Proveedores")
