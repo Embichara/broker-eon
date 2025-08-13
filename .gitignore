@@ -24,4 +24,9 @@ eon.db
 
 # Logs / temp
 *.log
-*.tmp
+*.tmp__pycache__/
+.venv/
+.env
+eon.db
+.DS_Store
+
