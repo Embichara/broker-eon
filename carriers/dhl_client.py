@@ -1,182 +1,188 @@
 # carriers/dhl_client.py
-import os, base64, json, requests
+import os
+import requests
 from datetime import datetime, timedelta
-from urllib.parse import urlencode
 from dotenv import load_dotenv
 
-# Carga variables .env (busca en cwd)
 load_dotenv(".env")
 
-# --- Helpers de tiempo ---
-def _iso_utc():
-    # DHL acepta plannedShippingDateAndTime en ISO8601 (UTC)
-    return (datetime.utcnow() + timedelta(minutes=2)).replace(microsecond=0).isoformat() + "Z"
+def _get_env(name, default=None):
+    v = os.getenv(name, default)
+    if isinstance(v, str):
+        v = v.strip()
+    return v
 
-def _today():
+DHL_API_KEY     = _get_env("DHL_API_KEY")
+DHL_API_SECRET  = _get_env("DHL_API_SECRET")  # opcional (fallback Basic)
+DHL_ACCOUNT     = _get_env("DHL_ACCOUNT_NUMBER")
+ENV             = (_get_env("DHL_ENV", "sandbox") or "sandbox").lower()
+
+# Si tu tenant te dio usuario/contraseña explícitos para Basic:
+BASIC_USER = _get_env("DHL_BASIC_USER")
+BASIC_PASS = _get_env("DHL_BASIC_PASS")
+
+BASE = (
+    "https://express.api.dhl.com/mydhlapi"
+    if ENV in ("prod", "production", "live")
+    else "https://express.api.dhl.com/mydhlapi/test"
+)
+
+def _today_iso_date():
     return datetime.utcnow().date().isoformat()
 
-# --- Config base / entorno ---
-def _base_url():
-    env = (os.getenv("DHL_ENV") or "sandbox").lower()
-    # En sandbox/test el endpoint real suele ser el /express.api.../test
-    if env in ("sandbox", "test"):
-        return "https://express.api.dhl.com/mydhlapi/test"
-    # Producción
-    return "https://express.api.dhl.com/mydhlapi"
+def _iso_in(hours: int = 2):
+    return (datetime.utcnow() + timedelta(hours=hours)).replace(microsecond=0).isoformat() + "Z"
 
-def _basic_headers():
-    key = os.getenv("DHL_API_KEY")
-    secret = os.getenv("DHL_API_SECRET")
-    if not key or not secret:
-        raise RuntimeError("Faltan DHL_API_KEY y/o DHL_API_SECRET en .env")
-
-    token = base64.b64encode(f"{key}:{secret}".encode()).decode()
+def _headers():
+    if not DHL_API_KEY:
+        raise RuntimeError("Falta DHL_API_KEY en .env")
     return {
-        "Authorization": f"Basic {token}",
         "Accept": "application/json",
+        "DHL-API-Key": DHL_API_KEY,
     }
 
-# ------------------- API: /rates -------------------
+def _auth_primary():
+    # Si hay credenciales explícitas de Basic en .env
+    if BASIC_USER and BASIC_PASS:
+        return (BASIC_USER, BASIC_PASS)
+    # Si no, intenta con API_KEY/API_SECRET (algunos tenants lo usan como Basic)
+    if DHL_API_KEY and DHL_API_SECRET:
+        return (DHL_API_KEY, DHL_API_SECRET)
+    return None
+
+def _mk_params(origen_cp, destino_cp, peso_kg, largo, ancho, alto,
+               origin_city, dest_city, origin_country, dest_country,
+               is_customs_declarable):
+    # Envío doméstico: no declarable. Internacional: respeta flag (default True).
+    customs = False
+    if origin_country.upper() != dest_country.upper():
+        customs = bool(is_customs_declarable) if is_customs_declarable is not None else True
+
+    params = {
+        "originCountryCode": origin_country.upper(),
+        "originPostalCode": str(origen_cp).strip(),
+        "destinationCountryCode": dest_country.upper(),
+        "destinationPostalCode": str(destino_cp).strip(),
+        "plannedShippingDate": _today_iso_date(),
+        "unitOfMeasurement": "metric",
+        "strictValidation": "false",
+        "isCustomsDeclarable": "true" if customs else "false",
+        "weight": float(peso_kg),
+        "length": float(largo),
+        "width": float(ancho),
+        "height": float(alto),
+    }
+    if origin_city:
+        params["originCityName"] = origin_city
+    if dest_city:
+        params["destinationCityName"] = dest_city
+    return params
+
 def cotizar_dhl(
     origen_cp: str,
     destino_cp: str,
     peso_kg: float,
+    *,
     largo: float = 10.0,
     ancho: float = 10.0,
     alto: float = 10.0,
-    origin_country: str = "MX",
-    dest_country: str = "MX",
     origin_city: str | None = None,
     dest_city: str | None = None,
-    is_customs_declarable: bool = False,
-):
-    if not origin_city or not dest_city:
-        raise RuntimeError("DHL requiere originCityName y destinationCityName (ciudades).")
+    origin_country: str = "MX",
+    dest_country: str = "MX",
+    is_customs_declarable: bool | None = None,  # aceptado por compatibilidad con tu UI
+) -> dict:
+    """
+    Intenta /rates con varias estrategias para evitar 401:
+      1) Header DHL-API-Key + accountNumber
+      2) (si 401) Header + Basic Auth
+      3) (si 401 y sandbox) Header (+Basic si disponible) sin accountNumber
+    Devuelve: {"mode": "GET", "attempt": <int>, "url": <url>, "json": <dict>}
+    """
+    headers = _headers()
+    url = f"{BASE}/rates"
 
-    base = _base_url()
-    headers = _basic_headers()
-
-    # --- Fechas candidatas: próximos 7 días, privilegiando días hábiles ---
-    from datetime import date, timedelta
-    hoy = date.today()
-    candidates = []
-    # primero agrega próximo lunes si hoy es sábado/domingo
-    for i in range(0, 7):
-        d = hoy + timedelta(days=i)
-        candidates.append(d)
-
-    def is_weekend(d: date):
-        return d.weekday() >= 5  # 5=sábado, 6=domingo
-
-    # reordena: días hábiles primero
-    candidates.sort(key=lambda d: (is_weekend(d), d))
-
-    account = os.getenv("DHL_ACCOUNT_NUMBER")
-    if not account:
-        raise RuntimeError("Falta DHL_ACCOUNT_NUMBER en .env")
-
-    base_params = dict(
-        accountNumber=account,
-        originCountryCode=origin_country,
-        originPostalCode=str(origen_cp),
-        originCityName=origin_city,
-        destinationCountryCode=dest_country,
-        destinationPostalCode=str(destino_cp),
-        destinationCityName=dest_city,
-        unitOfMeasurement="metric",
-        isCustomsDeclarable=str(is_customs_declarable).lower(),
-        weight=float(peso_kg),
-        length=float(largo),
-        width=float(ancho),
-        height=float(alto),
-        strictValidation="false",
+    # Params base
+    params = _mk_params(
+        origen_cp, destino_cp, peso_kg, largo, ancho, alto,
+        origin_city, dest_city, origin_country, dest_country,
+        is_customs_declarable,
     )
 
-    errors = []
-    # --- Intentos GET por cada fecha candidata ---
-    for d in candidates:
-        # 1) plannedShippingDate solo
-        params = {**base_params, "plannedShippingDate": d.isoformat()}
-        url = f"{base}/rates?{urlencode(params)}"
-        r = requests.get(url, headers=headers, timeout=45)
-        if r.status_code == 200:
-            return {"mode": "GET", "url": r.url, "params": params, "json": r.json()}
+    attempts = []
 
-        errors.append(("GET", r.status_code, r.reason, url, r.text[:800]))
+    # ---- Attempt 1: API-Key + accountNumber (si hay cuenta)
+    auth = None
+    if DHL_ACCOUNT:
+        params_1 = dict(params)
+        params_1["accountNumber"] = DHL_ACCOUNT
+        r1 = requests.get(url, headers=headers, params=params_1, auth=auth, timeout=45)
+        attempts.append(("APIKEY+ACC", r1.status_code, r1.url, r1.text))
+        if r1.status_code < 400:
+            return {"mode": "GET", "attempt": 1, "url": r1.url, "json": r1.json()}
+        if r1.status_code != 401:
+            # error diferente a 401: propagar
+            raise requests.HTTPError(f"{r1.status_code} {r1.reason}\nURL={r1.url}\nBODY={r1.text}", response=r1)
 
-        # 2) plannedShippingDate + plannedShippingDateAndTime
-        params2 = {**params, "plannedShippingDateAndTime": (datetime.utcnow().replace(microsecond=0).isoformat() + "Z")}
-        url2 = f"{base}/rates?{urlencode(params2)}"
-        r2 = requests.get(url2, headers=headers, timeout=45)
-        if r2.status_code == 200:
-            return {"mode": "GET", "url": r2.url, "params": params2, "json": r2.json()}
+    # ---- Attempt 2: API-Key + Basic Auth + accountNumber
+    auth = _auth_primary()
+    if auth and DHL_ACCOUNT:
+        params_2 = dict(params)
+        params_2["accountNumber"] = DHL_ACCOUNT
+        r2 = requests.get(url, headers=headers, params=params_2, auth=auth, timeout=45)
+        attempts.append(("APIKEY+BASIC+ACC", r2.status_code, r2.url, r2.text))
+        if r2.status_code < 400:
+            return {"mode": "GET", "attempt": 2, "url": r2.url, "json": r2.json()}
+        if r2.status_code != 401:
+            raise requests.HTTPError(f"{r2.status_code} {r2.reason}\nURL={r2.url}\nBODY={r2.text}", response=r2)
 
-        errors.append(("GET", r2.status_code, r2.reason, url2, r2.text[:800]))
+    # ---- Attempt 3 (solo sandbox): sin accountNumber
+    if ENV != "prod":
+        params_3 = dict(params)
+        # sin accountNumber
+        r3 = requests.get(url, headers=headers, params=params_3, auth=auth, timeout=45)
+        attempts.append(("SANDBOX_NO_ACC" + ("+BASIC" if auth else ""), r3.status_code, r3.url, r3.text))
+        if r3.status_code < 400:
+            return {"mode": "GET", "attempt": 3, "url": r3.url, "json": r3.json()}
+        # si aquí no es 401, propaga
+        if r3.status_code != 401:
+            raise requests.HTTPError(f"{r3.status_code} {r3.reason}\nURL={r3.url}\nBODY={r3.text}", response=r3)
 
-    # --- POST como plan C con la primera fecha hábil de candidates ---
-    d0 = next((d for d in candidates if not is_weekend(d)), candidates[0])
-    body = {
-        "customerDetails": {
-            "shipperDetails":   {"postalCode": str(origen_cp),  "countryCode": origin_country, "cityName": origin_city},
-            "receiverDetails":  {"postalCode": str(destino_cp), "countryCode": dest_country,   "cityName": dest_city},
-        },
-        "accounts": [{"number": account, "typeCode": "shipper"}],
-        "plannedShippingDateAndTime": (datetime.utcnow().replace(microsecond=0).isoformat() + "Z"),
-        "unitOfMeasurement": "metric",
-        "isCustomsDeclarable": bool(is_customs_declarable),
-        "packages": [{"weight": float(peso_kg), "dimensions": {"length": float(largo), "width": float(ancho), "height": float(alto)}}],
-        "requestAllValueAddedServices": True,
-        # "productCode": "N",  # si tu tenant lo exige, prueba 'N' o 'G'
-    }
-    r3 = requests.post(f"{base}/rates", headers={**headers, "Content-Type": "application/json"}, json=body, timeout=60)
-    if r3.status_code == 200:
-        return {"mode": "POST", "url": f"{base}/rates", "body": body, "json": r3.json()}
+    # Si todos fallan con 401
+    # Construimos un mensaje claro con los intentos realizados (sin exponer el API Key)
+    lines = ["All attempts failed for /rates (401 Unauthorized). Tried:"]
+    for label, code, tried_url, body in attempts:
+        lines.append(f"- {label}: {code}\n  URL={tried_url}\n  BODY={body}")
+    raise requests.HTTPError("\n".join(lines))
 
-    def short(txt): 
-        return txt if len(txt) < 800 else txt[:800] + "...(+recortado)"
-    raise RuntimeError(
-        "All attempts failed for /rates (Basic Auth):\n\n" +
-        "\n\n".join([f"{m} {code} {reason}\nURL={u}\nBODY={short(b)}" for (m,code,reason,u,b) in errors[:6]]) +
-        (f"\n\nPOST {r3.status_code} {r3.reason}\nBODY={short(r3.text)}" if r3 is not None else "")
-    )
-
-# ------------------- Normalizador → ofertas internas -------------------
-def normalizar_ofertas_dhl(resp_json: dict):
-    """
-    Convierte la respuesta de DHL en lista de ofertas estandarizadas:
-    [{"carrier":"DHL","productCode":"G","productName":"ECONOMY SELECT DOMESTIC",
-      "totalPrice":629.38,"currency":"MXN","eta":"2025-08-11","raw":{...}}, ...]
-    """
+def normalizar_ofertas_dhl(data_json: dict) -> list[dict]:
     ofertas = []
-    products = resp_json.get("products") or []
+    products = data_json.get("products") or []
     for p in products:
-        totals = p.get("totalPrice") or []
-        total, currency = None, None
-        # prioriza MXN
-        for t in totals:
-            if t.get("priceCurrency") == "MXN":
-                total = t.get("price"); currency = "MXN"; break
-        if total is None and totals:
-            total = totals[0].get("price")
-            currency = totals[0].get("priceCurrency")
+        code = p.get("productCode")
+        name = p.get("productName") or code or "N/D"
+        total_prices = p.get("totalPrice") or []
+        price_mxn = next((x for x in total_prices if (x or {}).get("priceCurrency") == "MXN"), None)
+        price_any = price_mxn or (total_prices[0] if total_prices else None)
+        price = (price_any or {}).get("price")
+        curr = (price_any or {}).get("priceCurrency") or "MXN"
 
-        # ETA
-        eta = None
-        dc = p.get("deliveryCapabilities") or {}
-        if dc.get("estimatedDeliveryDateAndTime"):
-            eta = str(dc["estimatedDeliveryDateAndTime"]).split("T")[0]
+        deliv = p.get("deliveryCapabilities") or {}
+        eta = deliv.get("estimatedDeliveryDateAndTime")
+        etd_days = deliv.get("totalTransitDays")
+        etd = None
+        if isinstance(etd_days, (int, float)) or (isinstance(etd_days, str) and etd_days.isdigit()):
+            etd = int(etd_days)
 
-        # Evita productos "cero" (operativos) si no traen monto
-        if total is not None and float(total) > 0:
+        if code is not None and price is not None:
             ofertas.append({
-                "carrier": "DHL",
-                "productCode": p.get("productCode"),
-                "productName": p.get("productName"),
-                "totalPrice": float(total),
-                "currency": currency or "MXN",
+                "productCode": code,
+                "productName": name,
+                "totalPrice": float(price),
+                "currency": curr,
                 "eta": eta,
+                "etd_days": etd,
                 "raw": p,
             })
-
     ofertas.sort(key=lambda x: x["totalPrice"])
     return ofertas
